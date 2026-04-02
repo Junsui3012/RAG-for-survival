@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Frontend — Development image
+#  Runs the Vite dev server with HMR (hot-module replacement).
+#  This image is NEVER used in production — docker-compose.dev.yml selects it.
+# ══════════════════════════════════════════════════════════════════════════════
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy manifests before the bind-mount takes effect.
+# The bind-mount in docker-compose.dev.yml overlays ./frontend/src → /app/src
+# at runtime, but node_modules must be installed into the image layer first
+# so they aren't swept away by the mount.
+COPY package.json package-lock.json ./
+
+# Full install — includes devDependencies (vite, @vitejs/plugin-react, etc.).
+# Unlike the production Dockerfile we do NOT use --omit=dev, because the
+# dev server, HMR, and TypeScript tools ARE the point of this image.
+RUN npm install
+
+# Source is overlaid at runtime via bind-mount; COPY . . would be overwritten
+# immediately and is therefore skipped here to keep the build fast.
+
+EXPOSE 5173
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:5173/ || exit 1
+
+# Drop to the non-root node user that ships with the official image (uid 1000).
+USER node
+
+# WHY `-- --host 0.0.0.0`?
+# By default Vite binds to 127.0.0.1 (loopback only). Inside a Docker
+# container 127.0.0.1 is local to the container — the Docker bridge network
+# and the host cannot reach it. Binding to 0.0.0.0 makes Vite listen on ALL
+# interfaces including the container's bridge IP, so:
+#   • The host browser can access http://localhost:5173 via Docker's port mapping.
+#   • HMR websocket traffic (used for hot-reload) can also reach the container.
+# The `--` separates `npm run dev` args from the Vite CLI args that follow.
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

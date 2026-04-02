@@ -1,0 +1,111 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Survival RAG — Development overrides
+#
+#  This file EXTENDS docker-compose.yml — it does not duplicate it.
+#  Only keys that differ from production are listed here. Compose merges the
+#  two files at runtime:
+#
+#    docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+#  Compose v2 deep-merge rules:
+#    • Scalar values (image, command, …) are replaced by the override value.
+#    • Maps (environment, build, …) are merged key-by-key.
+#    • Lists (ports, volumes, …) are APPENDED, not replaced — be careful not
+#      to accidentally duplicate entries that already appear in the base file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Frontend — replace Nginx with the Vite dev server ─────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      # Point to the lightweight dev Dockerfile. Compose merge replaces the
+      # `target: runner` from docker-compose.yml with this dockerfile key.
+      dockerfile: Dockerfile.dev
+    image: survival-rag/frontend-dev:latest
+
+    # Replace the prod port mapping (3000 → 80) with the Vite port.
+    ports:
+      - "5173:5173"   # Vite's default HMR port
+
+    volumes:
+      # Bind-mount ONLY the src directory, not the whole project, so that:
+      #   • Vite's file watcher sees changes immediately (hot-module reload).
+      #   • node_modules on the host (if any) don't shadow the container's.
+      - ./frontend/src:/app/src
+
+    environment:
+      # Tell the Vite dev-server proxy where to find the backend.
+      # This is a build-time env var (VITE_ prefix) — it is injected into
+      # the JavaScript bundle, not available server-side.
+      VITE_API_URL: http://localhost:5000
+
+    # Override healthcheck for Vite's port.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+
+  # ── Backend — hot-reload with Node 20's built-in watch mode ───────────────
+  backend:
+    # Override the production CMD. `node --watch` is Node 20's built-in file
+    # watcher — it restarts the process when any imported file changes.
+    # This avoids adding nodemon as a dependency just for container dev.
+    command: ["node", "--watch", "server.js"]
+
+    volumes:
+      # Bind-mount the entire backend directory so edits on the host are
+      # reflected inside the container without rebuilding.
+      - ./backend:/app
+
+      # Anonymous volume that shadows /app/node_modules with the container's
+      # installed modules. Without this, the host's node_modules (or lack
+      # thereof) would overlay the container's, breaking imports.
+      # The anonymous volume is populated from the image layer at start time.
+      - /app/node_modules
+
+    # Expose the backend port directly for Postman / curl debugging.
+    # In the base file this is already published (5000:5000), so this entry
+    # is here only for documentation clarity.
+    ports:
+      - "5000:5000"
+
+
+  # ── AI Service — hot-reload with Uvicorn's --reload flag ──────────────────
+  ai-service:
+    build:
+      context: ./ai-service
+      # Use the `base` stage (not `prod`) so we get the full Python env
+      # without the locked-down CMD — the dev command below overrides it.
+      target: base
+
+    # Uvicorn's --reload watches for .py file changes and restarts the worker.
+    # Combined with the bind-mount below, edits to ai-service/ are reflected
+    # in the running container within seconds.
+    command:
+      - uvicorn
+      - main:app
+      - --reload
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+
+    volumes:
+      # Bind-mount the full ai-service source for live editing.
+      - ./ai-service:/app
+
+      # Protect the ChromaDB data directory from being overwritten by the
+      # bind-mount above. The anonymous volume takes precedence for this
+      # path, keeping embeddings isolated inside Docker storage.
+      - /app/chroma_db
+
+    # Expose 8000 to the host so you can hit the FastAPI Swagger UI directly:
+    #   http://localhost:8000/docs
+    # In production this port has NO mapping — only backend can reach it.
+    ports:
+      - "8000:8000"

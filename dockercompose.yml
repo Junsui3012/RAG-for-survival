@@ -1,2 +1,190 @@
-# Step 2: Full Docker Compose config added here
-services: {}
+# ══════════════════════════════════════════════════════════════════════════════
+#  Survival RAG — Production Docker Compose
+#
+#  Compose v2 spec: no top-level "version" field.
+#  (The "version" key was deprecated in Compose v2 and is now ignored;
+#   omitting it avoids lint warnings and future-proofs the file.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  mongo_data:
+    # MongoDB's data directory. A named volume (not a bind-mount) is used so
+    # Docker manages the lifecycle — data survives `docker compose down` but is
+    # cleaned up cleanly by `docker compose down -v` when you want a fresh slate.
+
+  chroma_data:
+    # ChromaDB persists its HNSW vector index and SQLite metadata here.
+    # Keeping it in a volume means embeddings survive container restarts without
+    # needing to re-ingest all PDFs.
+
+  extracted_images:
+    # Images extracted from PDFs by PyMuPDF are stored here so the ai-service
+    # can reference them by path without baking them into the image layer.
+
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  ragnet:
+    driver: bridge
+    # All four services share this single bridge network so they can reach each
+    # other by service name (Docker's embedded DNS resolves 'mongo', 'backend',
+    # etc.). External traffic enters ONLY through the published ports on
+    # 'frontend' (3000 → 80) and 'backend' (5000 → 5000). Every other service
+    # is reachable only from within the network — not from the host.
+
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── MongoDB 7 ───────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped   # restart after crash but not after `docker compose stop`
+    networks:
+      - ragnet
+    volumes:
+      - mongo_data:/data/db   # persist database files across container restarts
+    environment:
+      # Secrets come from .env — never hard-coded here.
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: survivalrag
+
+    # WHY no `ports:` for mongo?
+    # Exposing port 27017 to the host would allow any process on the host
+    # (or anyone who can reach the host's IP) to attempt authentication.
+    # Because 'mongo' is on ragnet, only other containers on ragnet can connect —
+    # backend uses the URI mongodb://mongo:27017 over the internal network,
+    # and nothing else needs to reach it. This follows the principle of least
+    # exposure: don't publish a port unless something outside Docker needs it.
+
+    healthcheck:
+      # mongosh --eval "..." exits 0 when the replica set primary is ready.
+      # `db.adminCommand('ping').ok` returns 1 when mongod is accepting connections.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --username
+        - ${MONGO_ROOT_USER}
+        - --password
+        - ${MONGO_ROOT_PASSWORD}
+        - --authenticationDatabase
+        - admin
+        - --eval
+        - "db.adminCommand('ping').ok"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s   # mongod needs time to initialise its storage engine
+
+
+  # ── AI Service (FastAPI + Uvicorn) ───────────────────────────────────────────
+  ai-service:
+    build:
+      context: ./ai-service
+      target: prod        # use only the production stage of the multi-stage build
+    image: survival-rag/ai-service:latest
+    restart: unless-stopped
+    env_file: .env        # inject all secrets from .env at runtime — never baked in
+    networks:
+      - ragnet
+
+    # WHY NO `ports:` mapping?
+    # ai-service must NOT be reachable from the host or the public internet.
+    # It exposes port 8000 *inside* ragnet so backend can call it via
+    # http://ai-service:8000, but without a `ports:` entry Docker never
+    # publishes that port to the host's network interface.
+    # This enforces the architecture decision: only backend is a valid client.
+
+    volumes:
+      - chroma_data:/app/chroma_db
+        # ChromaDB vector store — persist embeddings across restarts
+
+      - extracted_images:/app/data/extracted_images
+        # Images extracted from PDFs — shared between ingest runs
+
+      - ./ai-service/data/pdfs:/app/data/pdfs:ro
+        # Bind-mount the PDF corpus as read-only.
+        # :ro means the container cannot modify the source PDFs — a safeguard
+        # so a bug in the ingestor can't corrupt the originals.
+        # The host path is relative to the project root; adjust if your PDFs
+        # live elsewhere.
+
+    depends_on:
+      mongo:
+        condition: service_healthy   # wait until mongo passes its healthcheck
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # sentence-transformers loads model weights on first boot
+
+
+  # ── Backend (Node.js 20 / Express 4.19) ──────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      # No `target:` — the backend Dockerfile has only one stage.
+    image: survival-rag/backend:latest
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - ragnet
+    environment:
+      # These two vars override anything in .env and are always safe to hard-code
+      # here because they are *internal* service addresses, not secrets.
+      AI_SERVICE_URL: http://ai-service:8000
+      MONGO_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo:27017/survivalrag?authSource=admin
+
+    depends_on:
+      mongo:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy   # don't start until the AI service is ready to accept requests
+
+    ports:
+      # 5000 is published to the host so developers can curl/Postman the API
+      # directly without going through the Nginx frontend proxy.
+      # In a hardened production deployment you would remove this mapping and
+      # route all traffic via the frontend container.
+      - "5000:5000"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+
+  # ── Frontend (Nginx serving React/Vite build) ────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      target: runner      # use the nginx stage, skipping the node builder stage
+    image: survival-rag/frontend:latest
+    restart: unless-stopped
+    networks:
+      - ragnet
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    ports:
+      # 3000 on the host → 80 inside the container (Nginx).
+      # Using 3000 rather than 80 on the host means you don't need root or
+      # CAP_NET_BIND_SERVICE to run the stack locally.
+      # In production behind a load-balancer / CDN you'd remove this and let
+      # the LB talk to port 80 directly on the container's IP.
+      - "3000:80"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
