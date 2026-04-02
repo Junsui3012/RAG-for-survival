@@ -1,0 +1,9 @@
+/* index.css — Global styles with Tailwind directives and survival theme */
+/* Step 1: Scaffold only */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-forest-dark text-parchment;
+}

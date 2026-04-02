@@ -1,0 +1,12 @@
+// main.jsx — React application entry point
+// Step 6: App wrapped in AuthProvider here
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+)
